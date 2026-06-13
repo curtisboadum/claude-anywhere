@@ -22,6 +22,7 @@ import './adapters/weixin-adapter.js';
 
 import type { LLMProvider } from 'claude-to-im/src/lib/bridge/host.js';
 import { loadConfig, configToSettings, CTI_HOME } from './config.js';
+import { migrateStrandedBindings } from './binding-migration.js';
 import type { Config } from './config.js';
 import { JsonFileStore } from './store.js';
 import { SDKLLMProvider, resolveClaudeCliPath, preflightCheck } from './llm-provider.js';
@@ -165,6 +166,10 @@ async function main(): Promise<void> {
 
   const settings = configToSettings(config);
   const store = new JsonFileStore(settings);
+  const migrated = migrateStrandedBindings(store, config);
+  if (migrated > 0) {
+    console.log(`[claude-to-im] Force-auto active: migrated ${migrated} binding(s) from ask -> code`);
+  }
   const pendingPerms = new PendingPermissions();
   const llm = await resolveProvider(config, pendingPerms);
   console.log(`[claude-to-im] Runtime: ${config.runtime}`);

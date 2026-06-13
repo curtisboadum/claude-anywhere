@@ -1,8 +1,14 @@
 /**
- * Telegram Adapter — implements BaseChannelAdapter for Telegram Bot API.
- *
- * Uses long polling to consume updates, persists offset watermark to DB,
- * and routes messages/callbacks through an internal async queue.
+ * @file telegram-adapter.ts
+ * @description Implements BaseChannelAdapter for the Telegram Bot API. Uses long
+ *   polling to consume updates, persists the offset watermark to the DB, routes
+ *   messages/callbacks through an internal async queue, and registers the bot
+ *   command menu. Authorization is strict: only the allowlisted sender userId
+ *   (or a 1:1 private chat) is accepted.
+ * @status Modified (fix/bridge-auto-slash-callbacks): strict userId auth,
+ *   command-menu scope + logging, replaced two `any` casts.
+ * @issues none known.
+ * @todo none.
  */
 
 import crypto from 'crypto';
@@ -110,7 +116,7 @@ export class TelegramAdapter extends BaseChannelAdapter {
     this.abortController = new AbortController();
 
     // Register bot commands menu with Telegram
-    this.registerCommands().catch(() => {});
+    this.registerCommands().catch(err => console.warn('[telegram-adapter] registerCommands error:', err instanceof Error ? err.message : err));
 
     // Start polling in background (no await — runs until stop())
     this.pollLoop().catch(err => {
@@ -227,12 +233,17 @@ export class TelegramAdapter extends BaseChannelAdapter {
   }
 
   isAuthorized(userId: string, chatId: string): boolean {
-    // Check bridge-specific allowed users first
+    // Check bridge-specific allowed users first.
     const allowedUsers = getBridgeContext().store.getSetting('telegram_bridge_allowed_users') || '';
     if (allowedUsers) {
       const allowed = allowedUsers.split(',').map(s => s.trim()).filter(Boolean);
       if (allowed.length > 0) {
-        return allowed.includes(userId) || allowed.includes(chatId);
+        // Match strictly by sender userId. A chatId is only accepted when it
+        // equals the userId (a 1:1 private chat) — this closes the group hole
+        // where any member of an allowlisted group chatId could authorize
+        // themselves via the chatId match.
+        const isPrivateChat = chatId === userId;
+        return allowed.includes(userId) || (isPrivateChat && allowed.includes(chatId));
       }
     }
 
@@ -342,7 +353,10 @@ export class TelegramAdapter extends BaseChannelAdapter {
     const token = this.botToken;
     if (!token) return;
 
-    await callTelegramApi(token, 'setMyCommands', {
+    // Scope to all private chats so the menu reliably attaches in DMs; without
+    // an explicit scope Telegram may not surface the commands. Log success and
+    // failure (previously the call site swallowed all errors silently).
+    const result = await callTelegramApi(token, 'setMyCommands', {
       commands: [
         { command: 'new', description: 'Start new session (optionally specify path)' },
         { command: 'bind', description: 'Bind to existing session' },
@@ -353,7 +367,13 @@ export class TelegramAdapter extends BaseChannelAdapter {
         { command: 'stop', description: 'Stop current task' },
         { command: 'help', description: 'Show available commands' },
       ],
+      scope: { type: 'all_private_chats' },
     });
+    if (result.ok) {
+      console.log('[telegram-adapter] Bot command menu registered (all_private_chats)');
+    } else {
+      console.warn('[telegram-adapter] Failed to register command menu:', result.error);
+    }
   }
 
   private enqueue(msg: InboundMessage): void {
@@ -394,7 +414,7 @@ export class TelegramAdapter extends BaseChannelAdapter {
         method: 'GET',
         signal: AbortSignal.timeout(10_000),
       });
-      const data: any = await res.json();
+      const data = await res.json() as { ok?: boolean; result?: { id?: number | string } };
       if (data.ok && data.result?.id) {
         this.botUserId = String(data.result.id);
 
@@ -487,12 +507,12 @@ export class TelegramAdapter extends BaseChannelAdapter {
 
         if (!this.running) break;
 
-        const data: any = await res.json();
+        const data = await res.json() as { ok?: boolean; result?: unknown };
         if (!data.ok || !Array.isArray(data.result)) {
           console.warn('[telegram-adapter] getUpdates failed:', JSON.stringify(data).slice(0, 200));
           continue;
         }
-        const updates: TelegramUpdate[] = data.result;
+        const updates = data.result as TelegramUpdate[];
         for (const update of updates) {
           // Advance fetchOffset so the next getUpdates call skips this update
           if (update.update_id >= fetchOffset) {

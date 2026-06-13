@@ -1,10 +1,14 @@
 /**
- * Bridge Manager — singleton orchestrator for the multi-IM bridge system.
- *
- * Manages adapter lifecycles, routes inbound messages through the
- * conversation engine, and coordinates permission handling.
- *
- * Uses globalThis to survive Next.js HMR in development.
+ * @file bridge-manager.ts
+ * @description Singleton orchestrator for the multi-IM bridge system. Manages
+ *   adapter lifecycles, routes inbound messages through the conversation engine,
+ *   dispatches slash commands, and coordinates permission handling. Uses
+ *   globalThis to survive Next.js HMR in development.
+ * @status Modified (fix/bridge-auto-slash-callbacks): pass approver userId into
+ *   the permission callback; refuse `/mode ask` under force-auto; extracted the
+ *   message/command handlers into sub-functions to satisfy the length gate.
+ * @issues none known.
+ * @todo none.
  */
 
 import type { BridgeStatus, InboundMessage, OutboundMessage, StreamingPreviewState, ToolCallInfo } from './types.js';
@@ -457,111 +461,25 @@ async function handleMessage(
 
   // Handle callback queries (permission buttons)
   if (msg.callbackData) {
-    const handled = broker.handlePermissionCallback(msg.callbackData, msg.address.chatId, msg.callbackMessageId);
-    if (handled) {
-      // Send confirmation
-      const confirmMsg: OutboundMessage = {
-        address: msg.address,
-        text: 'Permission response recorded.',
-        parseMode: 'plain',
-      };
-      await deliver(adapter, confirmMsg);
-    }
+    await handlePermissionCallbackMessage(adapter, msg);
     ack();
     return;
   }
 
   const rawText = msg.text.trim();
-  const hasAttachments = msg.attachments && msg.attachments.length > 0;
+  const hasAttachments = !!(msg.attachments && msg.attachments.length > 0);
 
-  // Handle attachment-only download failures — surface error to user instead of silently dropping
+  // Surface attachment-only download failures instead of silently dropping them.
   if (!rawText && !hasAttachments) {
-    const rawData = msg.raw as {
-      imageDownloadFailed?: boolean;
-      attachmentDownloadFailed?: boolean;
-      failedCount?: number;
-      failedLabel?: string;
-      userVisibleError?: string;
-    } | undefined;
-    if (rawData?.userVisibleError) {
-      await deliver(adapter, {
-        address: msg.address,
-        text: rawData.userVisibleError,
-        parseMode: 'plain',
-        replyToMessageId: msg.messageId,
-      });
-    } else if (rawData?.imageDownloadFailed || rawData?.attachmentDownloadFailed) {
-      const failureLabel = rawData.failedLabel || (rawData.imageDownloadFailed ? 'image(s)' : 'attachment(s)');
-      await deliver(adapter, {
-        address: msg.address,
-        text: `Failed to download ${rawData.failedCount ?? 1} ${failureLabel}. Please try sending again.`,
-        parseMode: 'plain',
-        replyToMessageId: msg.messageId,
-      });
-    }
+    await handleEmptyMessage(adapter, msg);
     ack();
     return;
   }
 
-  // ── Numeric shortcut for permission replies (feishu/qq/weixin only) ──
-  // On mobile, typing `/perm allow <uuid>` is painful.
-  // If the user sends "1", "2", or "3" and there is exactly one pending
-  // permission for this chat, map it: 1→allow, 2→allow_session, 3→deny.
-  //
-  // Input normalization: mobile keyboards / IM clients may send fullwidth
-  // digits (１２３), digits with zero-width joiners, or other Unicode
-  // variants. NFKC normalization folds them all to ASCII 1/2/3.
-  if (
-    adapter.channelType === 'feishu'
-    || adapter.channelType === 'qq'
-    || adapter.channelType === 'weixin'
-  ) {
-    // eslint-disable-next-line no-control-regex
-    const normalized = rawText.normalize('NFKC').replace(/[\u200B-\u200D\uFEFF]/g, '').trim();
-    if (/^[123]$/.test(normalized)) {
-      const pendingLinks = store.listPendingPermissionLinksByChat(msg.address.chatId);
-      if (pendingLinks.length === 1) {
-        const actionMap: Record<string, string> = { '1': 'allow', '2': 'allow_session', '3': 'deny' };
-        const action = actionMap[normalized];
-        const permId = pendingLinks[0].permissionRequestId;
-        const callbackData = `perm:${action}:${permId}`;
-        const handled = broker.handlePermissionCallback(callbackData, msg.address.chatId);
-        const label = normalized === '1' ? 'Allow' : normalized === '2' ? 'Allow Session' : 'Deny';
-        if (handled) {
-          await deliver(adapter, {
-            address: msg.address,
-            text: `${label}: recorded.`,
-            parseMode: 'plain',
-            replyToMessageId: msg.messageId,
-          });
-        } else {
-          await deliver(adapter, {
-            address: msg.address,
-            text: `Permission not found or already resolved.`,
-            parseMode: 'plain',
-            replyToMessageId: msg.messageId,
-          });
-        }
-        ack();
-        return;
-      }
-      if (pendingLinks.length > 1) {
-        // Multiple pending permissions — numeric shortcut is ambiguous.
-        await deliver(adapter, {
-          address: msg.address,
-          text: `Multiple pending permissions (${pendingLinks.length}). Please use the full command:\n/perm allow|allow_session|deny <id>`,
-          parseMode: 'plain',
-          replyToMessageId: msg.messageId,
-        });
-        ack();
-        return;
-      }
-      // pendingLinks.length === 0: no pending permissions, fall through as normal message
-    } else if (rawText !== normalized && /^[123]$/.test(rawText) === false) {
-      // Log when normalization changed the text — helps diagnose encoding issues
-      const codePoints = [...rawText].map(c => 'U+' + c.codePointAt(0)!.toString(16).toUpperCase().padStart(4, '0'));
-      console.log(`[bridge-manager] Shortcut candidate raw codepoints: ${codePoints.join(' ')} → normalized: "${normalized}"`);
-    }
+  // Numeric permission shortcut (feishu/qq/weixin). Returns true when consumed.
+  if (await tryHandleNumericShortcut(adapter, msg, store, rawText)) {
+    ack();
+    return;
   }
 
   // Check for IM commands (before sanitization — commands are validated individually)
@@ -571,33 +489,123 @@ async function handleMessage(
     return;
   }
 
-  // Sanitize general message text before routing to conversation engine
-  const { text, truncated } = sanitizeInput(rawText);
-  if (truncated) {
-    console.warn(`[bridge-manager] Input truncated from ${rawText.length} to ${text.length} chars for chat ${msg.address.chatId}`);
-    store.insertAuditLog({
-      channelType: adapter.channelType,
-      chatId: msg.address.chatId,
-      direction: 'inbound',
-      messageId: msg.messageId,
-      summary: `[TRUNCATED] Input truncated from ${rawText.length} chars`,
+  await routeToConversation(adapter, msg, store, rawText, hasAttachments, ack);
+}
+
+/**
+ * Resolve a permission inline-button callback. Passes the approver's userId so
+ * the broker enforces that only the requester may resolve their own request.
+ */
+async function handlePermissionCallbackMessage(
+  adapter: BaseChannelAdapter,
+  msg: InboundMessage,
+): Promise<void> {
+  const handled = broker.handlePermissionCallback(
+    msg.callbackData!,
+    msg.address.chatId,
+    msg.callbackMessageId,
+    msg.address.userId,
+  );
+  if (handled) {
+    await deliver(adapter, {
+      address: msg.address,
+      text: 'Permission response recorded.',
+      parseMode: 'plain',
     });
   }
+}
 
-  if (!text && !hasAttachments) { ack(); return; }
+/** Surface attachment-only download failures instead of silently dropping them. */
+async function handleEmptyMessage(adapter: BaseChannelAdapter, msg: InboundMessage): Promise<void> {
+  const rawData = msg.raw as {
+    imageDownloadFailed?: boolean;
+    attachmentDownloadFailed?: boolean;
+    failedCount?: number;
+    failedLabel?: string;
+    userVisibleError?: string;
+  } | undefined;
+  if (rawData?.userVisibleError) {
+    await deliver(adapter, {
+      address: msg.address,
+      text: rawData.userVisibleError,
+      parseMode: 'plain',
+      replyToMessageId: msg.messageId,
+    });
+  } else if (rawData?.imageDownloadFailed || rawData?.attachmentDownloadFailed) {
+    const failureLabel = rawData.failedLabel || (rawData.imageDownloadFailed ? 'image(s)' : 'attachment(s)');
+    await deliver(adapter, {
+      address: msg.address,
+      text: `Failed to download ${rawData.failedCount ?? 1} ${failureLabel}. Please try sending again.`,
+      parseMode: 'plain',
+      replyToMessageId: msg.messageId,
+    });
+  }
+}
 
-  // Regular message — route to conversation engine
-  const binding = router.resolve(msg.address);
+/**
+ * Numeric shortcut for permission replies (feishu/qq/weixin only). On mobile,
+ * typing `/perm allow <uuid>` is painful. If the user sends "1", "2", or "3"
+ * and there is exactly one pending permission for this chat, map it:
+ * 1→allow, 2→allow_session, 3→deny. NFKC normalization folds fullwidth digits
+ * and zero-width-joined variants to ASCII. Returns true when consumed.
+ */
+async function tryHandleNumericShortcut(
+  adapter: BaseChannelAdapter,
+  msg: InboundMessage,
+  store: ReturnType<typeof getBridgeContext>['store'],
+  rawText: string,
+): Promise<boolean> {
+  if (
+    adapter.channelType !== 'feishu'
+    && adapter.channelType !== 'qq'
+    && adapter.channelType !== 'weixin'
+  ) {
+    return false;
+  }
+  const normalized = rawText.normalize('NFKC').replace(/[​-‍﻿]/g, '').trim();
+  if (!/^[123]$/.test(normalized)) {
+    if (rawText !== normalized && /^[123]$/.test(rawText) === false) {
+      const codePoints = [...rawText].map(c => 'U+' + c.codePointAt(0)!.toString(16).toUpperCase().padStart(4, '0'));
+      console.log(`[bridge-manager] Shortcut candidate raw codepoints: ${codePoints.join(' ')} → normalized: "${normalized}"`);
+    }
+    return false;
+  }
 
-  // Notify adapter that message processing is starting (e.g., typing indicator)
-  adapter.onMessageStart?.(msg.address.chatId);
+  const pendingLinks = store.listPendingPermissionLinksByChat(msg.address.chatId);
+  if (pendingLinks.length === 1) {
+    const actionMap: Record<string, string> = { '1': 'allow', '2': 'allow_session', '3': 'deny' };
+    const action = actionMap[normalized];
+    const permId = pendingLinks[0].permissionRequestId;
+    const handled = broker.handlePermissionCallback(`perm:${action}:${permId}`, msg.address.chatId, undefined, msg.address.userId);
+    const label = normalized === '1' ? 'Allow' : normalized === '2' ? 'Allow Session' : 'Deny';
+    await deliver(adapter, {
+      address: msg.address,
+      text: handled ? `${label}: recorded.` : `Permission not found or already resolved.`,
+      parseMode: 'plain',
+      replyToMessageId: msg.messageId,
+    });
+    return true;
+  }
+  if (pendingLinks.length > 1) {
+    await deliver(adapter, {
+      address: msg.address,
+      text: `Multiple pending permissions (${pendingLinks.length}). Please use the full command:\n/perm allow|allow_session|deny <id>`,
+      parseMode: 'plain',
+      replyToMessageId: msg.messageId,
+    });
+    return true;
+  }
+  // pendingLinks.length === 0: no pending permissions, fall through as normal message
+  return false;
+}
 
-  // Create an AbortController so /stop can cancel this task externally
-  const taskAbort = new AbortController();
-  const state = getState();
-  state.activeTasks.set(binding.codepilotSessionId, taskAbort);
-
-  // ── Streaming preview setup ──────────────────────────────────
+/** Build the combined partial-text + tool-event callbacks for streaming previews/cards. */
+function buildStreamingCallbacks(adapter: BaseChannelAdapter, msg: InboundMessage): {
+  previewState: StreamingPreviewState | null;
+  hasStreamingCards: boolean;
+  onPartialText?: (fullText: string) => void;
+  onToolEvent?: (toolId: string, toolName: string, status: 'running' | 'complete' | 'error') => void;
+} {
   let previewState: StreamingPreviewState | null = null;
   const caps = adapter.getPreviewCapabilities?.(msg.address.chatId) ?? null;
   if (caps?.supported) {
@@ -614,13 +622,11 @@ async function handleMessage(
 
   const streamCfg = previewState ? getStreamConfig(adapter.channelType) : null;
 
-  // Build the preview onPartialText callback (or undefined if preview not supported)
   const previewOnPartialText = (previewState && streamCfg) ? (fullText: string) => {
     const ps = previewState!;
     const cfg = streamCfg!;
     if (ps.degraded) return;
 
-    // Truncate to maxChars + ellipsis
     ps.pendingText = fullText.length > cfg.maxChars
       ? fullText.slice(0, cfg.maxChars) + '...'
       : fullText;
@@ -629,7 +635,6 @@ async function handleMessage(
     const elapsed = Date.now() - ps.lastSentAt;
 
     if (delta < cfg.minDeltaChars && ps.lastSentAt > 0) {
-      // Not enough new content — schedule trailing-edge timer if not already set
       if (!ps.throttleTimer) {
         ps.throttleTimer = setTimeout(() => {
           ps.throttleTimer = null;
@@ -640,7 +645,6 @@ async function handleMessage(
     }
 
     if (elapsed < cfg.intervalMs && ps.lastSentAt > 0) {
-      // Too soon — schedule trailing-edge timer to ensure latest text is sent
       if (!ps.throttleTimer) {
         ps.throttleTimer = setTimeout(() => {
           ps.throttleTimer = null;
@@ -650,7 +654,6 @@ async function handleMessage(
       return;
     }
 
-    // Clear any pending trailing-edge timer and flush immediately
     if (ps.throttleTimer) {
       clearTimeout(ps.throttleTimer);
       ps.throttleTimer = null;
@@ -658,11 +661,7 @@ async function handleMessage(
     flushPreview(adapter, ps, cfg);
   } : undefined;
 
-  // ── Streaming card setup (Feishu CardKit v2) ──────────────────
-  // If the adapter supports streaming cards (e.g. Feishu), wire up
-  // onStreamText, onToolEvent, and onStreamEnd callbacks.
-  // These run in parallel with the existing preview system — Feishu
-  // uses cards instead of message edit for streaming.
+  // Streaming card setup (Feishu CardKit v2): runs in parallel with the preview system.
   const hasStreamingCards = typeof adapter.onStreamText === 'function';
   const toolCallTracker = new Map<string, ToolCallInfo>();
 
@@ -674,7 +673,6 @@ async function handleMessage(
     if (toolName) {
       toolCallTracker.set(toolId, { id: toolId, name: toolName, status });
     } else {
-      // tool_result doesn't carry name — update existing entry's status
       const existing = toolCallTracker.get(toolId);
       if (existing) existing.status = status;
     }
@@ -683,16 +681,94 @@ async function handleMessage(
     } catch { /* non-critical */ }
   } : undefined;
 
-  // Combined partial text callback: streaming preview + streaming cards
   const onPartialText = (previewOnPartialText || onStreamCardText) ? (fullText: string) => {
     if (previewOnPartialText) previewOnPartialText(fullText);
     if (onStreamCardText) onStreamCardText(fullText);
   } : undefined;
 
+  return { previewState, hasStreamingCards, onPartialText, onToolEvent };
+}
+
+/** Deliver the engine result text (or error) and persist the SDK session id. */
+async function deliverEngineResult(
+  adapter: BaseChannelAdapter,
+  msg: InboundMessage,
+  store: ReturnType<typeof getBridgeContext>['store'],
+  binding: import('./types.js').ChannelBinding,
+  result: Awaited<ReturnType<typeof engine.processMessage>>,
+  hasStreamingCards: boolean,
+): Promise<void> {
+  // Finalize streaming card if supported; returns true when content is already visible.
+  let cardFinalized = false;
+  if (hasStreamingCards && adapter.onStreamEnd) {
+    try {
+      const status = result.hasError ? 'error' : 'completed';
+      cardFinalized = await adapter.onStreamEnd(msg.address.chatId, status, result.responseText);
+    } catch (err) {
+      console.warn('[bridge-manager] Card finalize failed:', err instanceof Error ? err.message : err);
+    }
+  }
+
+  if (result.responseText) {
+    if (!cardFinalized) {
+      await deliverResponse(adapter, msg.address, result.responseText, binding.codepilotSessionId, msg.messageId);
+    }
+  } else if (result.hasError) {
+    await deliver(adapter, {
+      address: msg.address,
+      text: `<b>Error:</b> ${escapeHtml(result.errorMessage)}`,
+      parseMode: 'HTML',
+      replyToMessageId: msg.messageId,
+    });
+  }
+
+  // Persist the actual SDK session ID for future resume; clear a stale id on error.
+  if (binding.id) {
+    try {
+      const update = computeSdkSessionUpdate(result.sdkSessionId, result.hasError);
+      if (update !== null) {
+        store.updateChannelBinding(binding.id, { sdkSessionId: update });
+      }
+    } catch { /* best effort */ }
+  }
+}
+
+/** Route a regular (non-command) message through the conversation engine. */
+async function routeToConversation(
+  adapter: BaseChannelAdapter,
+  msg: InboundMessage,
+  store: ReturnType<typeof getBridgeContext>['store'],
+  rawText: string,
+  hasAttachments: boolean,
+  ack: () => void,
+): Promise<void> {
+  // Sanitize general message text before routing to conversation engine
+  const { text, truncated } = sanitizeInput(rawText);
+  if (truncated) {
+    console.warn(`[bridge-manager] Input truncated from ${rawText.length} to ${text.length} chars for chat ${msg.address.chatId}`);
+    store.insertAuditLog({
+      channelType: adapter.channelType,
+      chatId: msg.address.chatId,
+      direction: 'inbound',
+      messageId: msg.messageId,
+      summary: `[TRUNCATED] Input truncated from ${rawText.length} chars`,
+    });
+  }
+
+  if (!text && !hasAttachments) { ack(); return; }
+
+  const binding = router.resolve(msg.address);
+  adapter.onMessageStart?.(msg.address.chatId);
+
+  // Create an AbortController so /stop can cancel this task externally
+  const taskAbort = new AbortController();
+  const state = getState();
+  state.activeTasks.set(binding.codepilotSessionId, taskAbort);
+
+  const { previewState, hasStreamingCards, onPartialText, onToolEvent } = buildStreamingCallbacks(adapter, msg);
+
   try {
-    // Pass permission callback so requests are forwarded to IM immediately
-    // during streaming (the stream blocks until permission is resolved).
-    // Use text or empty string for image-only messages (prompt is still required by streamClaude)
+    // Use text or empty string for image-only messages (prompt still required by streamClaude)
     const promptText = text || (hasAttachments ? 'Describe this image.' : '');
 
     const result = await engine.processMessage(binding, promptText, async (perm) => {
@@ -708,48 +784,8 @@ async function handleMessage(
       );
     }, taskAbort.signal, hasAttachments ? msg.attachments : undefined, onPartialText, onToolEvent);
 
-    // Finalize streaming card if adapter supports it.
-    // onStreamEnd awaits any in-flight card creation and returns true if a card
-    // was actually finalized (meaning content is already visible to the user).
-    let cardFinalized = false;
-    if (hasStreamingCards && adapter.onStreamEnd) {
-      try {
-        const status = result.hasError ? 'error' : 'completed';
-        cardFinalized = await adapter.onStreamEnd(msg.address.chatId, status, result.responseText);
-      } catch (err) {
-        console.warn('[bridge-manager] Card finalize failed:', err instanceof Error ? err.message : err);
-      }
-    }
-
-    // Send response text — render via channel-appropriate format.
-    // Skip if streaming card was finalized (content already in card).
-    if (result.responseText) {
-      if (!cardFinalized) {
-        await deliverResponse(adapter, msg.address, result.responseText, binding.codepilotSessionId, msg.messageId);
-      }
-    } else if (result.hasError) {
-      const errorResponse: OutboundMessage = {
-        address: msg.address,
-        text: `<b>Error:</b> ${escapeHtml(result.errorMessage)}`,
-        parseMode: 'HTML',
-        replyToMessageId: msg.messageId,
-      };
-      await deliver(adapter, errorResponse);
-    }
-
-    // Persist the actual SDK session ID for future resume.
-    // If the result has an error and no session ID was captured, clear the
-    // stale ID so the next message starts fresh instead of retrying a broken resume.
-    if (binding.id) {
-      try {
-        const update = computeSdkSessionUpdate(result.sdkSessionId, result.hasError);
-        if (update !== null) {
-          store.updateChannelBinding(binding.id, { sdkSessionId: update });
-        }
-      } catch { /* best effort */ }
-    }
+    await deliverEngineResult(adapter, msg, store, binding, result, hasStreamingCards);
   } finally {
-    // Clean up preview state
     if (previewState) {
       if (previewState.throttleTimer) {
         clearTimeout(previewState.throttleTimer);
@@ -758,7 +794,6 @@ async function handleMessage(
       adapter.endPreview?.(msg.address.chatId, previewState.draftId);
     }
 
-    // If task was aborted and streaming card is still active, finalize as interrupted
     if (hasStreamingCards && adapter.onStreamEnd && taskAbort.signal.aborted) {
       try {
         await adapter.onStreamEnd(msg.address.chatId, 'interrupted', '');
@@ -766,15 +801,14 @@ async function handleMessage(
     }
 
     state.activeTasks.delete(binding.codepilotSessionId);
-    // Notify adapter that message processing ended
     adapter.onMessageEnd?.(msg.address.chatId);
-    // Commit the offset only after full processing (success or failure)
     ack();
   }
 }
 
 /**
- * Handle IM slash commands.
+ * Handle IM slash commands. Parses the command, runs dangerous-input detection,
+ * dispatches to a grouped handler, and delivers the response.
  */
 async function handleCommand(
   adapter: BaseChannelAdapter,
@@ -808,28 +842,72 @@ async function handleCommand(
     return;
   }
 
-  let response = '';
+  const response =
+    commandSessionMgmt(command, msg, args)
+    ?? commandSessionInfo(command, adapter, msg, args)
+    ?? commandHelpText(command)
+    ?? `Unknown command: ${escapeHtml(command)}\nType /help for available commands.`;
 
+  if (response) {
+    await deliver(adapter, {
+      address: msg.address,
+      text: response,
+      parseMode: 'HTML',
+      replyToMessageId: msg.messageId,
+    });
+  }
+}
+
+/** Static help/usage text commands. Returns null if not one of these. */
+function commandHelpText(command: string): string | null {
+  if (command === '/start') {
+    return [
+      '<b>CodePilot Bridge</b>',
+      '',
+      'Send any message to interact with Claude.',
+      '',
+      '<b>Commands:</b>',
+      '/new [path] - Start new session',
+      '/bind &lt;session_id&gt; - Bind to existing session',
+      '/cwd /path - Change working directory',
+      '/mode plan|code|ask - Change mode',
+      '/status - Show current status',
+      '/sessions - List recent sessions',
+      '/stop - Stop current session',
+      '/perm allow|allow_session|deny &lt;id&gt; - Respond to permission',
+      '/help - Show this help',
+    ].join('\n');
+  }
+  if (command === '/help') {
+    return [
+      '<b>CodePilot Bridge Commands</b>',
+      '',
+      '/new [path] - Start new session',
+      '/bind &lt;session_id&gt; - Bind to existing session',
+      '/cwd /path - Change working directory',
+      '/mode plan|code|ask - Change mode',
+      '/status - Show current status',
+      '/sessions - List recent sessions',
+      '/stop - Stop current session',
+      '/perm allow|allow_session|deny &lt;id&gt; - Respond to permission request',
+      '1/2/3 - Quick permission reply (Feishu/QQ/WeChat, single pending)',
+      '/help - Show this help',
+    ].join('\n');
+  }
+  return null;
+}
+
+/**
+ * Session-management commands (/new, /bind, /cwd, /mode). Returns the response
+ * text, or null if `command` is not handled here. Under force-auto (auto-approve
+ * + ack) the `ask` mode is refused so the user is never stranded behind prompts.
+ */
+export function commandSessionMgmt(
+  command: string,
+  msg: InboundMessage,
+  args: string,
+): string | null {
   switch (command) {
-    case '/start':
-      response = [
-        '<b>CodePilot Bridge</b>',
-        '',
-        'Send any message to interact with Claude.',
-        '',
-        '<b>Commands:</b>',
-        '/new [path] - Start new session',
-        '/bind &lt;session_id&gt; - Bind to existing session',
-        '/cwd /path - Change working directory',
-        '/mode plan|code|ask - Change mode',
-        '/status - Show current status',
-        '/sessions - List recent sessions',
-        '/stop - Stop current session',
-        '/perm allow|allow_session|deny &lt;id&gt; - Respond to permission',
-        '/help - Show this help',
-      ].join('\n');
-      break;
-
     case '/new': {
       // Abort any running task on the current session before creating a new one
       const oldBinding = router.resolve(msg.address);
@@ -844,64 +922,64 @@ async function handleCommand(
       if (args) {
         const validated = validateWorkingDirectory(args);
         if (!validated) {
-          response = 'Invalid path. Must be an absolute path without traversal sequences.';
-          break;
+          return 'Invalid path. Must be an absolute path without traversal sequences.';
         }
         workDir = validated;
       }
       const binding = router.createBinding(msg.address, workDir);
-      response = `New session created.\nSession: <code>${binding.codepilotSessionId.slice(0, 8)}...</code>\nCWD: <code>${escapeHtml(binding.workingDirectory || '~')}</code>`;
-      break;
+      return `New session created.\nSession: <code>${binding.codepilotSessionId.slice(0, 8)}...</code>\nCWD: <code>${escapeHtml(binding.workingDirectory || '~')}</code>`;
     }
 
     case '/bind': {
-      if (!args) {
-        response = 'Usage: /bind &lt;session_id&gt;';
-        break;
-      }
+      if (!args) return 'Usage: /bind &lt;session_id&gt;';
       if (!validateSessionId(args)) {
-        response = 'Invalid session ID format. Expected a 32-64 character hex/UUID string.';
-        break;
+        return 'Invalid session ID format. Expected a 32-64 character hex/UUID string.';
       }
       const binding = router.bindToSession(msg.address, args);
-      if (binding) {
-        response = `Bound to session <code>${args.slice(0, 8)}...</code>`;
-      } else {
-        response = 'Session not found.';
-      }
-      break;
+      return binding ? `Bound to session <code>${args.slice(0, 8)}...</code>` : 'Session not found.';
     }
 
     case '/cwd': {
-      if (!args) {
-        response = 'Usage: /cwd /path/to/directory';
-        break;
-      }
+      if (!args) return 'Usage: /cwd /path/to/directory';
       const validatedPath = validateWorkingDirectory(args);
       if (!validatedPath) {
-        response = 'Invalid path. Must be an absolute path without traversal sequences or special characters.';
-        break;
+        return 'Invalid path. Must be an absolute path without traversal sequences or special characters.';
       }
       const binding = router.resolve(msg.address);
       router.updateBinding(binding.id, { workingDirectory: validatedPath });
-      response = `Working directory set to <code>${escapeHtml(validatedPath)}</code>`;
-      break;
+      return `Working directory set to <code>${escapeHtml(validatedPath)}</code>`;
     }
 
     case '/mode': {
-      if (!validateMode(args)) {
-        response = 'Usage: /mode plan|code|ask';
-        break;
+      if (!validateMode(args)) return 'Usage: /mode plan|code|ask';
+      const forceAuto = getBridgeContext().store.getSetting('bridge_force_auto') === 'true';
+      if (forceAuto && args === 'ask') {
+        return 'Auto-approve is enabled (CTI_AUTO_APPROVE), so <b>ask</b> mode is disabled — staying in <b>code</b>. Unset CTI_AUTO_APPROVE to use ask mode.';
       }
       const binding = router.resolve(msg.address);
       router.updateBinding(binding.id, { mode: args });
-      response = `Mode set to <b>${args}</b>`;
-      break;
+      return `Mode set to <b>${args}</b>`;
     }
 
+    default:
+      return null;
+  }
+}
+
+/**
+ * Session-info and control commands (/status, /sessions, /stop, /perm).
+ * Returns the response text, or null if `command` is not handled here.
+ */
+function commandSessionInfo(
+  command: string,
+  adapter: BaseChannelAdapter,
+  msg: InboundMessage,
+  args: string,
+): string | null {
+  switch (command) {
     case '/status': {
       const binding = router.resolve(msg.address);
-      response = [
+      return [
         '<b>Bridge Status</b>',
         '',
         `Session: <code>${binding.codepilotSessionId.slice(0, 8)}...</code>`,
@@ -909,22 +987,17 @@ async function handleCommand(
         `Mode: <b>${binding.mode}</b>`,
         `Model: <code>${binding.model || 'default'}</code>`,
       ].join('\n');
-      break;
     }
 
     case '/sessions': {
       const bindings = router.listBindings(adapter.channelType);
-      if (bindings.length === 0) {
-        response = 'No sessions found.';
-      } else {
-        const lines = ['<b>Sessions:</b>', ''];
-        for (const b of bindings.slice(0, 10)) {
-          const active = b.active ? 'active' : 'inactive';
-          lines.push(`<code>${b.codepilotSessionId.slice(0, 8)}...</code> [${active}] ${escapeHtml(b.workingDirectory || '~')}`);
-        }
-        response = lines.join('\n');
+      if (bindings.length === 0) return 'No sessions found.';
+      const lines = ['<b>Sessions:</b>', ''];
+      for (const b of bindings.slice(0, 10)) {
+        const active = b.active ? 'active' : 'inactive';
+        lines.push(`<code>${b.codepilotSessionId.slice(0, 8)}...</code> [${active}] ${escapeHtml(b.workingDirectory || '~')}`);
       }
-      break;
+      return lines.join('\n');
     }
 
     case '/stop': {
@@ -934,61 +1007,25 @@ async function handleCommand(
       if (taskAbort) {
         taskAbort.abort();
         st.activeTasks.delete(binding.codepilotSessionId);
-        response = 'Stopping current task...';
-      } else {
-        response = 'No task is currently running.';
+        return 'Stopping current task...';
       }
-      break;
+      return 'No task is currently running.';
     }
 
     case '/perm': {
       // Text-based permission approval fallback (for channels without inline buttons)
-      // Usage: /perm allow <id> | /perm allow_session <id> | /perm deny <id>
       const permParts = args.split(/\s+/);
       const permAction = permParts[0];
       const permId = permParts.slice(1).join(' ');
       if (!permAction || !permId || !['allow', 'allow_session', 'deny'].includes(permAction)) {
-        response = 'Usage: /perm allow|allow_session|deny &lt;permission_id&gt;';
-        break;
+        return 'Usage: /perm allow|allow_session|deny &lt;permission_id&gt;';
       }
-      const callbackData = `perm:${permAction}:${permId}`;
-      const handled = broker.handlePermissionCallback(callbackData, msg.address.chatId);
-      if (handled) {
-        response = `Permission ${permAction}: recorded.`;
-      } else {
-        response = `Permission not found or already resolved.`;
-      }
-      break;
+      const handled = broker.handlePermissionCallback(`perm:${permAction}:${permId}`, msg.address.chatId, undefined, msg.address.userId);
+      return handled ? `Permission ${permAction}: recorded.` : `Permission not found or already resolved.`;
     }
 
-    case '/help':
-      response = [
-        '<b>CodePilot Bridge Commands</b>',
-        '',
-        '/new [path] - Start new session',
-        '/bind &lt;session_id&gt; - Bind to existing session',
-        '/cwd /path - Change working directory',
-        '/mode plan|code|ask - Change mode',
-        '/status - Show current status',
-        '/sessions - List recent sessions',
-        '/stop - Stop current session',
-        '/perm allow|allow_session|deny &lt;id&gt; - Respond to permission request',
-        '1/2/3 - Quick permission reply (Feishu/QQ/WeChat, single pending)',
-        '/help - Show this help',
-      ].join('\n');
-      break;
-
     default:
-      response = `Unknown command: ${escapeHtml(command)}\nType /help for available commands.`;
-  }
-
-  if (response) {
-    await deliver(adapter, {
-      address: msg.address,
-      text: response,
-      parseMode: 'HTML',
-      replyToMessageId: msg.messageId,
-    });
+      return null;
   }
 }
 
