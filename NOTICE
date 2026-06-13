@@ -1,0 +1,19 @@
+claude-anywhere
+===============
+
+This project vendors and modifies two MIT-licensed projects by op7418:
+
+  • Claude-to-IM         (https://github.com/op7418/Claude-to-IM)
+      vendored at:  ./Claude-to-IM/
+      license:      ./Claude-to-IM/LICENSE   (MIT, © 2025 op7418)
+
+  • Claude-to-IM-skill   (https://github.com/op7418/Claude-to-IM-skill)
+      vendored at:  ./Claude-to-IM-skill/
+      license:      ./Claude-to-IM-skill/LICENSE   (MIT, © 2024-2025 op7418)
+
+Modifications in this distribution (security hardening, bridge-enforced per-session
+git worktree isolation, abuse controls, Telegram UX) are © 2026 Curtis Boadum and
+released under the MIT License (see ./LICENSE).
+
+The original copyright notices and permission notices are retained in the vendored
+subdirectories as required by the MIT License.

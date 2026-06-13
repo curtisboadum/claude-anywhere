@@ -1,0 +1,61 @@
+#!/usr/bin/env bash
+# claude-anywhere — manage the Claude-Code-to-Telegram bridge daemon.
+set -euo pipefail
+
+# Resolve the real repo root even when invoked via a symlink.
+SELF="${BASH_SOURCE[0]}"
+while [ -L "$SELF" ]; do SELF="$(readlink "$SELF")"; done
+ROOT="$(cd "$(dirname "$SELF")/.." && pwd)"
+SKILL="$ROOT/Claude-to-IM-skill"
+DAEMON="$SKILL/scripts/daemon.sh"
+CTI_HOME="${CTI_HOME:-$HOME/.claude-to-im}"
+CONFIG="$CTI_HOME/config.env"
+
+usage() {
+  cat <<EOF
+claude-anywhere — drive Claude Code from your phone
+
+  claude-anywhere start      Start the bridge daemon (background)
+  claude-anywhere stop       Stop the daemon
+  claude-anywhere restart    Restart (pick up config changes)
+  claude-anywhere status     Show running state
+  claude-anywhere logs [N]   Tail the last N log lines (default 50)
+  claude-anywhere whoami     Print your Telegram chat id (message the bot first; stop the daemon first)
+  claude-anywhere config     Print the config file path
+  claude-anywhere doctor     Run diagnostics
+
+Config: $CONFIG
+Docs:   $ROOT/README.md
+EOF
+}
+
+cmd="${1:-}"; shift || true
+case "$cmd" in
+  start|stop|restart|status)
+    exec bash "$DAEMON" "$cmd" "$@" ;;
+  logs)
+    N="${1:-50}"; tail -n "$N" "$CTI_HOME/logs/bridge.log" 2>/dev/null || echo "no log yet" ;;
+  config)
+    echo "$CONFIG" ;;
+  doctor)
+    if [ -x "$SKILL/scripts/doctor.sh" ]; then exec bash "$SKILL/scripts/doctor.sh" "$@"; else bash "$DAEMON" status; fi ;;
+  whoami)
+    [ -f "$CONFIG" ] || { echo "No config at $CONFIG — run install.sh first." >&2; exit 1; }
+    TOKEN="$(grep -E '^CTI_TG_BOT_TOKEN=' "$CONFIG" | head -1 | cut -d= -f2-)"
+    [ -n "$TOKEN" ] || { echo "CTI_TG_BOT_TOKEN not set in $CONFIG." >&2; exit 1; }
+    echo "Reading recent messages to your bot…"
+    curl -s "https://api.telegram.org/bot${TOKEN}/getUpdates" | node -e '
+      let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{
+        let d;try{d=JSON.parse(s)}catch{console.error("Bad response");process.exit(1)}
+        if(d.error_code===409){console.error("The daemon is polling — run: claude-anywhere stop, then whoami again.");process.exit(1)}
+        const res=d.result||[];const seen=new Set();let any=false;
+        for(const u of res){const m=u.message||u.edited_message||{};const f=m.from||{},c=m.chat||{};const k=f.id+":"+c.id;if(seen.has(k))continue;seen.add(k);
+          if(c.type==="private"&&f.id){any=true;console.log(`  user/chat id: ${f.id}   (@${f.username||f.first_name||"?"})`)}}
+        if(!any)console.log("  No private messages yet — open Telegram, send your bot any message, then run this again.");
+        else console.log("\nPut that id into CTI_TG_CHAT_ID and CTI_TG_ALLOWED_USERS in your config, then: claude-anywhere start");
+      })' ;;
+  ""|-h|--help|help)
+    usage ;;
+  *)
+    echo "Unknown command: $cmd" >&2; usage; exit 1 ;;
+esac
