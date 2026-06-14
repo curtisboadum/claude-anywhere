@@ -481,6 +481,10 @@ export class SDKLLMProvider implements LLMProvider {
             return;
           }
           let timeoutTimer: ReturnType<typeof setTimeout> | undefined;
+          // Distinguishes our wall-clock timeout abort from a user/other abort,
+          // so the catch can deliver a clear "hit the time limit" message
+          // instead of the cryptic "process aborted by user".
+          let timedOut = false;
 
           try {
             // Enforce per-session worktree isolation — the agent runs inside its
@@ -495,7 +499,10 @@ export class SDKLLMProvider implements LLMProvider {
 
             // Wall-clock session timeout — abort a runaway turn.
             if (params.abortController) {
-              timeoutTimer = setTimeout(() => params.abortController?.abort(), sessionTimeoutMs());
+              timeoutTimer = setTimeout(() => {
+                timedOut = true;
+                params.abortController?.abort();
+              }, sessionTimeoutMs());
             }
 
             const cleanEnv = buildSubprocessEnv();
@@ -592,6 +599,20 @@ export class SDKLLMProvider implements LLMProvider {
             console.error('[llm-provider] SDK query error:', err instanceof Error ? err.stack || err.message : err);
             if (stderrBuf) {
               console.error('[llm-provider] stderr from CLI:', stderrBuf.trim());
+            }
+
+            // ── Timeout abort ── our wall-clock timer fired. Always deliver a
+            // clear, actionable message so the turn never ends in silence.
+            if (timedOut) {
+              const mins = Math.round(sessionTimeoutMs() / 60000);
+              controller.enqueue(
+                sseEvent(
+                  'error',
+                  `⏱ Task hit the time limit (~${mins} min) and was stopped. Send a new message to continue from here.`,
+                ),
+              );
+              controller.close();
+              return;
             }
 
             const isTransportExit = message.includes('process exited with code');
