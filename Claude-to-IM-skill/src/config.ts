@@ -313,5 +313,10 @@ export function configToSettings(config: Config): Map<string, string> {
   }
   m.set("bridge_default_mode", config.defaultMode);
 
+  // Force-auto: when auto-approve is enabled AND acknowledged, the bridge never
+  // prompts. The bridge reads this to (a) refuse `/mode ask` and (b) keep the
+  // user out of the prompt-on-every-tool path. See main.ts startup migration.
+  m.set("bridge_force_auto", String(!!(config.autoApprove && config.autoApproveAck)));
+
   return m;
 }
